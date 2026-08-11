@@ -1,0 +1,2558 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>Hitster Tracker</title>
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="icon-192.png" />
+<link rel="apple-touch-icon" href="icon-180.png" />
+<meta name="theme-color" content="#121319" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Hitster Tracker" />
+<style>
+  html, body {
+    margin: 0; padding: 0; background:#121319;
+    overscroll-behavior-y: contain; /* no pull-to-refresh bounce */
+    overflow-x: hidden;
+  }
+  #root { min-height: 100vh; }
+  #boot-status {
+    font-family: sans-serif; color: #9195a6; padding: 24px; text-align: center;
+  }
+  #boot-error {
+    font-family: sans-serif; color: #ff6b6b; padding: 24px; white-space: pre-wrap;
+    background: #1b1d27; border-radius: 12px; margin: 16px; line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+<div id="root"><div id="boot-status">Betoltes...</div></div>
+
+<script>
+  // Local-storage backed shim for the window.storage API the component was
+  // originally written against (that API only exists inside Claude artifacts).
+  // Here we run as a plain standalone page, so we persist to the browser's
+  // own localStorage instead - same behavior, works fully offline once loaded.
+  window.storage = {
+    get: async function (key) {
+      try {
+        var v = localStorage.getItem(key);
+        return v === null ? null : { key: key, value: v, shared: false };
+      } catch (e) { return null; }
+    },
+    set: async function (key, value) {
+      try {
+        localStorage.setItem(key, value);
+        return { key: key, value: value, shared: false };
+      } catch (e) { return null; }
+    },
+    delete: async function (key) {
+      try {
+        localStorage.removeItem(key);
+        return { key: key, deleted: true, shared: false };
+      } catch (e) { return null; }
+    },
+    list: async function (prefix) {
+      try {
+        var keys = [];
+        for (var i = 0; i < localStorage.length; i++) {
+          var k = localStorage.key(i);
+          if (!prefix || k.indexOf(prefix) === 0) keys.push(k);
+        }
+        return { keys: keys };
+      } catch (e) { return null; }
+    }
+  };
+
+  // Track which CDN scripts actually loaded, so we can give a precise error
+  // instead of a blank page if the network/CDN blocks one of them.
+  window.__loaded = { react: false, reactDom: false, babel: false, firebase: false };
+  function showBootError(msg) {
+    var root = document.getElementById("root");
+    root.innerHTML = '<div id="boot-error"></div>';
+    document.getElementById("boot-error").textContent = msg;
+  }
+</script>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"
+        onload="window.__loaded.react = true"
+        onerror="showBootError('A React konyvtar nem toltodott be a CDN-rol (cdnjs.cloudflare.com). Ellenorizd az internetkapcsolatot, vagy probald ujra egy masik halozaton/bongeszoben.')"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"
+        onload="window.__loaded.reactDom = true"
+        onerror="showBootError('A ReactDOM konyvtar nem toltodott be a CDN-rol (cdnjs.cloudflare.com). Ellenorizd az internetkapcsolatot, vagy probald ujra egy masik halozaton/bongeszoben.')"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"
+        onload="window.__loaded.babel = true"
+        onerror="showBootError('A Babel konyvtar nem toltodott be a CDN-rol (cdnjs.cloudflare.com). Ellenorizd az internetkapcsolatot, vagy probald ujra egy masik halozaton/bongeszoben.')"></script>
+<!-- Firebase (Cloud Firestore) powers the optional multiplayer mode with room codes. It is not
+     required for the app to boot - single-device play works without it - so its absence only
+     surfaces as an error when the user actually tries to host/join a room, not as a blank page
+     on load. -->
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"
+        onload="window.__loaded.firebase = true"
+        onerror="console.warn('Firebase did not load - multiplayer mode will be unavailable.')"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"
+        onerror="console.warn('Firebase Firestore did not load - multiplayer mode will be unavailable.')"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"
+        onerror="console.warn('Firebase Auth did not load - multiplayer mode will be unavailable.')"></script>
+
+<!-- Component source is kept as plain text (not executed directly) so we can
+     control exactly how Babel compiles it - specifically, forcing the
+     "classic" JSX runtime, since the default "automatic" runtime injects an
+     ES module import statement that breaks in a plain (non-module) script
+     and silently leaves the page blank. -->
+<script type="text/plain" id="hitster-source">
+// ---------- helpers ----------
+const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+function playerColor(index) {
+  const hue = (index * 137.508) % 360; // golden angle -> distinct vivid hues
+  return {
+    solid: `hsl(${hue} 78% 58%)`,
+    soft: `hsl(${hue} 78% 58% / 0.16)`,
+  };
+}
+
+function checkSlot(timeline, slot, year) {
+  const left = slot > 0 ? timeline[slot - 1].year : -Infinity;
+  const right = slot < timeline.length ? timeline[slot].year : Infinity;
+  return year >= left && year <= right;
+}
+
+function insertSorted(timeline, card) {
+  let idx = timeline.length;
+  for (let i = 0; i < timeline.length; i++) {
+    if (card.year < timeline[i].year) {
+      idx = i;
+      break;
+    }
+  }
+  const copy = [...timeline];
+  copy.splice(idx, 0, card);
+  return copy;
+}
+
+const STORAGE_KEY = "hitster:gamestate:v3";
+
+// Firebase project config for multiplayer sync (Cloud Firestore). Not a secret - this is the
+// standard client-side app identifier, safe to embed directly.
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCt7X2jTHzkuRSgkO4v6VUC24t3RCfofi0",
+  authDomain: "hitster-tracker.firebaseapp.com",
+  projectId: "hitster-tracker",
+  storageBucket: "hitster-tracker.firebasestorage.app",
+  messagingSenderId: "646233510776",
+  appId: "1:646233510776:web:c868644874074c0238ee8d",
+  measurementId: "G-CW4BY138J0",
+};
+
+function ensureFirestore() {
+  if (typeof firebase === "undefined") return null;
+  try {
+    if (!firebase.apps || !firebase.apps.length) {
+      firebase.initializeApp(FIREBASE_CONFIG);
+    }
+    return firebase.firestore();
+  } catch (e) {
+    return null;
+  }
+}
+
+// Anonymous Auth gives each device a stable uid, which is what lets the Firestore security
+// rules tell "the host" apart from "some client with the room code" - without this, rules can
+// only inspect document content (which any client could spoof), not who is actually asking.
+let authSignInPromise = null;
+
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+  ]);
+}
+
+function ensureAuth() {
+  if (typeof firebase === "undefined" || typeof firebase.auth !== "function") {
+    return Promise.reject(new Error("A Firebase Auth modul nem töltődött be (ellenőrizd az internetkapcsolatot)."));
+  }
+  try {
+    if (!firebase.apps || !firebase.apps.length) {
+      firebase.initializeApp(FIREBASE_CONFIG);
+    }
+    const auth = firebase.auth();
+    if (auth.currentUser) return Promise.resolve(auth.currentUser.uid);
+    if (authSignInPromise) return authSignInPromise;
+    // This file is often opened via file:// (a downloaded HTML, not hosted on a server), where
+    // IndexedDB - which Firebase Auth normally uses to persist the sign-in - is frequently
+    // unavailable or restricted by the browser. That can make signInAnonymously() hang forever
+    // instead of failing fast. We don't need Firebase's own persistence anyway (we track our own
+    // session via window.storage), so force in-memory-only persistence first.
+    const persistenceReady = auth
+      .setPersistence(firebase.auth.Auth.Persistence.NONE)
+      .catch((err) => {
+        console.warn("[Hitster] setPersistence(NONE) failed, continuing anyway:", err);
+      });
+    const signInAttempt = persistenceReady.then(() => auth.signInAnonymously());
+    // Log the real outcome to the console regardless of our timeout race, in case it resolves
+    // or rejects late - this is the actual underlying reason, useful for diagnosing network issues.
+    signInAttempt.then(
+      () => console.log("[Hitster] signInAnonymously eventually resolved (after the UI may have already timed out)."),
+      (err) => console.error("[Hitster] signInAnonymously underlying error:", err)
+    );
+    authSignInPromise = withTimeout(
+      signInAttempt,
+      10000,
+      "Időtúllépés a bejelentkezésnél (10mp) - ellenőrizd, hogy az Anonymous sign-in be van-e kapcsolva a Firebase konzolon, és hogy nincs-e blokkolva a hálózat (VPN, tűzfal, privát DNS)."
+    )
+      .then((cred) => cred.user.uid)
+      .catch((err) => {
+        authSignInPromise = null;
+        throw err;
+      });
+    return authSignInPromise;
+  } catch (e) {
+    return Promise.reject(e);
+  }
+}
+
+// ---------- component ----------
+function HitsterTracker() {
+  const [screen, setScreen] = useState("menu"); // menu | lobby | game
+  const [players, setPlayers] = useState([]);
+  const [useTokens, setUseTokens] = useState(true);
+  const [startTokens, setStartTokens] = useState(2);
+  const [targetCards, setTargetCards] = useState(10);
+
+  const [turnIndex, setTurnIndex] = useState(0);
+  const [phase, setPhase] = useState("idle"); // starting_card | idle | placing | steal_window | reveal_entry | revealed | won
+  const [currentCard, setCurrentCard] = useState(null);
+  const [ownSlot, setOwnSlot] = useState(null);
+  const [stealAttempts, setStealAttempts] = useState([]); // {id, playerId, slot}
+  const [stealActorId, setStealActorId] = useState(null);
+  const [pendingAction, setPendingAction] = useState("normal"); // normal | redeem
+  const [redeemPlayerId, setRedeemPlayerId] = useState(null);
+  const [revealForm, setRevealForm] = useState({ year: "", title: "", artist: "" });
+  const [bonusGuess, setBonusGuess] = useState(false);
+  const [result, setResult] = useState(null);
+  const [winner, setWinner] = useState(null);
+  const [log, setLog] = useState([]);
+  const [round, setRound] = useState(1);
+
+  const loadedRef = useRef(false);
+  const saveTimer = useRef(null);
+
+  // ---- multiplayer (Cloud Firestore) ----
+  const [mpIntent, setMpIntent] = useState("local"); // local | host | join
+  const [mpRole, setMpRole] = useState(null); // null | host | client
+  const [mpStatus, setMpStatus] = useState("idle"); // idle | connecting | connected | error
+  const [mpError, setMpError] = useState("");
+  const [mpCode, setMpCode] = useState("");
+  const [joinCodeInput, setJoinCodeInput] = useState("");
+  const [myPlayerId, setMyPlayerId] = useState(null);
+  const [presence, setPresence] = useState({}); // {playerId: lastSeenTimestamp}, for "left the room" indicators
+  const [nowTick, setNowTick] = useState(Date.now());
+  const roomRefRef = useRef(null); // Firestore doc reference for the active room
+  const unsubscribeRef = useRef(null); // Firestore onSnapshot unsubscribe function (main doc)
+  const unsubscribeActionsRef = useRef(null); // Firestore onSnapshot unsubscribe function (actions queue, host only)
+  const myUidRef = useRef(null); // this device's anonymous-auth uid
+  const hostUidRef = useRef(null); // the room's hostUid, included in every write so it never gets dropped
+  const skipBroadcastRef = useRef(false); // true right after applying a remote update, to avoid an echo write
+
+  // ---- persistent player roster (like the Kódfejtő/Sz@r apps) - managed independently of any game ----
+  const [savedPlayers, setSavedPlayers] = useState([]); // [{id, name}], this device only
+  const [savedTeams, setSavedTeams] = useState([]); // [{id, name, memberIds}], this device only
+  const [newPlayerName, setNewPlayerName] = useState("");
+  const [saveNewToRoster, setSaveNewToRoster] = useState(true);
+  const [manageNewName, setManageNewName] = useState("");
+  const [teamNameInput, setTeamNameInput] = useState("");
+  const [teamMemberIds, setTeamMemberIds] = useState([]);
+  const [gameType, setGameType] = useState("individual"); // individual | team | mixed
+  const [manualEntryType, setManualEntryType] = useState("individual"); // individual | team - only relevant when gameType is "mixed"
+  const savedPlayersLoadedRef = useRef(false);
+  const savedTeamsLoadedRef = useRef(false);
+
+  // ---- resumable game: a snapshot found on mount, offered via a "Folytatás" button in the menu ----
+  const [hasSavedGame, setHasSavedGame] = useState(false);
+  const savedGameRef = useRef(null);
+
+  // ---- persistence: load once on mount (doesn't jump straight in - see resumeSavedGame) ----
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY, false);
+        if (res && res.value) {
+          const data = JSON.parse(res.value);
+          if (data && data.screen === "game" && Array.isArray(data.players) && data.players.length) {
+            savedGameRef.current = data;
+            setHasSavedGame(true);
+          }
+        }
+      } catch (e) {
+        // no saved game, ignore
+      } finally {
+        loadedRef.current = true;
+      }
+    })();
+  }, []);
+
+  // ---- persistence: load the persistent player roster (separate from any game session) ----
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get("hitster:savedPlayers", false);
+        if (res && res.value) {
+          const list = JSON.parse(res.value);
+          if (Array.isArray(list)) setSavedPlayers(list);
+        }
+      } catch (e) {
+        // ignore
+      } finally {
+        savedPlayersLoadedRef.current = true;
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!savedPlayersLoadedRef.current) return;
+    window.storage.set("hitster:savedPlayers", JSON.stringify(savedPlayers), false).catch(() => {});
+  }, [savedPlayers]);
+
+  function rememberPlayer(name) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setSavedPlayers((list) => (list.some((p) => p.name === trimmed) ? list : [...list, { id: uid(), name: trimmed }]));
+  }
+
+  function rememberTeamByName(name) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setSavedTeams((list) => (list.some((t) => t.name === trimmed) ? list : [...list, { id: uid(), name: trimmed, memberIds: [] }]));
+  }
+
+  function removeSavedPlayer(id) {
+    setSavedPlayers((list) => list.filter((p) => p.id !== id));
+  }
+
+  // ---- persistence: load/save the persistent team roster ----
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get("hitster:savedTeams", false);
+        if (res && res.value) {
+          const list = JSON.parse(res.value);
+          if (Array.isArray(list)) setSavedTeams(list);
+        }
+      } catch (e) {
+        // ignore
+      } finally {
+        savedTeamsLoadedRef.current = true;
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!savedTeamsLoadedRef.current) return;
+    window.storage.set("hitster:savedTeams", JSON.stringify(savedTeams), false).catch(() => {});
+  }, [savedTeams]);
+
+  function teamDefaultName(memberIds) {
+    return memberIds
+      .map((id) => (savedPlayers.find((p) => p.id === id) || {}).name)
+      .filter(Boolean)
+      .join(" & ");
+  }
+
+  function toggleTeamMember(id) {
+    setTeamMemberIds((ids) => (ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]));
+  }
+
+  function createTeam() {
+    if (teamMemberIds.length < 2) return;
+    const name = teamNameInput.trim() || teamDefaultName(teamMemberIds);
+    setSavedTeams((list) => [...list, { id: uid(), name, memberIds: teamMemberIds }]);
+    setTeamMemberIds([]);
+    setTeamNameInput("");
+  }
+
+  function removeSavedTeam(id) {
+    setSavedTeams((list) => list.filter((t) => t.id !== id));
+  }
+
+  // ---- persistence: debounced save whenever game state changes ----
+  useEffect(() => {
+    if (!loadedRef.current) return;
+    if (screen !== "game") return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await window.storage.set(
+          STORAGE_KEY,
+          JSON.stringify({
+            screen,
+            players,
+            useTokens,
+            startTokens,
+            targetCards,
+            turnIndex,
+            phase,
+            pendingAction,
+            revealForm,
+            currentCard,
+            ownSlot,
+            stealAttempts,
+            result,
+            winner,
+            log,
+            round,
+            mpRole,
+            mpCode,
+            hostUid: hostUidRef.current,
+          }),
+          false
+        );
+      } catch (e) {
+        // storage failed, non-fatal
+      }
+    }, 300);
+    return () => clearTimeout(saveTimer.current);
+  }, [screen, players, useTokens, startTokens, targetCards, turnIndex, phase, pendingAction, revealForm, currentCard, ownSlot, stealAttempts, result, winner, log, round, mpRole, mpCode]);
+
+  function addLog(text) {
+    setLog((l) => [{ id: uid(), text }, ...l].slice(0, 200));
+  }
+
+  // ---------------- LOBBY: assembling this game's player list ----------------
+  function addPlayerToGame(name, save, saveAsTeam) {
+    const trimmed = name.trim();
+    if (!trimmed) return null;
+    const newPlayer = { id: uid(), name: trimmed, tokens: 0, timeline: [] };
+    setPlayers((ps) => [...ps, newPlayer]);
+    if (save) {
+      if (saveAsTeam) rememberTeamByName(trimmed);
+      else rememberPlayer(trimmed);
+    }
+    return newPlayer.id;
+  }
+
+  function addSavedPlayerToGame(savedPlayer) {
+    if (players.some((p) => p.name === savedPlayer.name)) return; // already in this game
+    setPlayers((ps) => [...ps, { id: uid(), name: savedPlayer.name, tokens: 0, timeline: [] }]);
+  }
+
+  function addSavedTeamToGame(team) {
+    if (players.some((p) => p.name === team.name)) return; // already in this game
+    setPlayers((ps) => [...ps, { id: uid(), name: team.name, tokens: 0, timeline: [] }]);
+  }
+
+  function removePlayerFromGame(id) {
+    setPlayers((ps) => ps.filter((p) => p.id !== id));
+    if (myPlayerId === id) setMyPlayerId(null);
+  }
+
+  function joinAsPlayer(name, save, saveAsTeam) {
+    const id = addPlayerToGame(name, save, saveAsTeam);
+    if (id) setMyPlayerId(id);
+    setNewPlayerName("");
+  }
+
+  function toggleMyReady() {
+    if (!myPlayerId) return;
+    setPlayers((ps) => ps.map((p) => (p.id === myPlayerId ? { ...p, ready: !p.ready } : p)));
+  }
+
+  function movePlayerOrder(id, direction) {
+    setPlayers((ps) => {
+      const idx = ps.findIndex((p) => p.id === id);
+      const swapWith = idx + direction;
+      if (idx < 0 || swapWith < 0 || swapWith >= ps.length) return ps;
+      const copy = [...ps];
+      [copy[idx], copy[swapWith]] = [copy[swapWith], copy[idx]];
+      return copy;
+    });
+  }
+
+  function shufflePlayerOrder() {
+    setPlayers((ps) => {
+      const copy = [...ps];
+      for (let i = copy.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [copy[i], copy[j]] = [copy[j], copy[i]];
+      }
+      return copy;
+    });
+  }
+
+
+  // ---------------- MENU -> LOBBY -> GAME transitions ----------------
+  function proceedToLobby() {
+    setPlayers([]);
+    setMyPlayerId(null);
+    if (mpIntent === "host") {
+      startHosting({ screen: "lobby", players: [] });
+    }
+    setScreen("lobby");
+  }
+
+  function backToMenu() {
+    teardownMp();
+    setPlayers([]);
+    setMyPlayerId(null);
+    setScreen("menu");
+  }
+
+  // Leaves the game screen for the main menu WITHOUT resetting anything - the game keeps living
+  // in memory (and on disk, via the debounced save effect) so it can be resumed later.
+  function pauseGameToMenu() {
+    setScreen("menu");
+  }
+
+  function resumeInMemoryGame() {
+    setScreen("game");
+  }
+
+  function resumeSavedGame() {
+    const data = savedGameRef.current;
+    if (!data) return;
+    setPlayers(data.players || []);
+    setUseTokens(data.useTokens);
+    setStartTokens(data.startTokens);
+    setTargetCards(data.targetCards);
+    setTurnIndex(data.turnIndex || 0);
+    setPhase(data.phase || "idle");
+    setPendingAction(data.pendingAction || "normal");
+    setRevealForm(data.revealForm || { year: "", title: "", artist: "" });
+    setCurrentCard(data.currentCard || null);
+    setOwnSlot(data.ownSlot ?? null);
+    setStealAttempts(data.stealAttempts || []);
+    setResult(data.result || null);
+    setWinner(data.winner || null);
+    setLog(data.log || []);
+    setRound(data.round || 1);
+    setScreen("game");
+    setHasSavedGame(false);
+
+    if (data.mpRole && data.mpCode) {
+      const db = ensureFirestore();
+      if (db) {
+        ensureAuth()
+          .then((uid) => {
+            myUidRef.current = uid;
+            const ref = db.collection("rooms").doc(data.mpCode);
+            roomRefRef.current = ref;
+            setMpRole(data.mpRole);
+            setMpCode(data.mpCode);
+            setMpStatus("connected");
+            subscribeToRoom(ref);
+            if (data.mpRole === "host") {
+              hostUidRef.current = data.hostUid || uid;
+              subscribeToActions(ref);
+            }
+          })
+          .catch((err) => {
+            setMpError("Nem sikerült visszakapcsolódni a szobához: " + (err && err.message ? err.message : err));
+            setMpStatus("error");
+          });
+      }
+    }
+  }
+
+  function beginGameFromLobby() {
+    if (players.length < 2) return;
+    setPlayers((ps) => ps.map((p) => ({ ...p, tokens: useTokens ? Number(startTokens) || 0 : 0 })));
+    setTurnIndex(0);
+    setPhase("starting_card");
+    setPendingAction("normal");
+    setRevealForm({ year: "", title: "", artist: "" });
+    setCurrentCard(null);
+    setOwnSlot(null);
+    setStealAttempts([]);
+    setResult(null);
+    setWinner(null);
+    setLog([{ id: uid(), text: "A játék elkezdődött — mindenki töltse ki a kezdő kártyáját!" }]);
+    setRound(1);
+    setScreen("game");
+  }
+
+  async function resetGame() {
+    teardownMp();
+    setMpIntent("local");
+    setScreen("menu");
+    setPlayers([]);
+    setWinner(null);
+    setHasSavedGame(false);
+    savedGameRef.current = null;
+    try {
+      await window.storage.delete(STORAGE_KEY, false);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // ---------------- GAME ACTIONS ----------------
+  const current = players[turnIndex];
+
+  // Called once per player, right as the game begins, to seed their timeline with a known
+  // starting card (no guessing involved - this is just "place your first card face up").
+  function submitStartingCard(form) {
+    const year = parseInt(form.year, 10);
+    if (!Number.isFinite(year)) return;
+    const title = (form.title || "").trim() || "Kezdő szám";
+    const artist = (form.artist || "").trim() || "—";
+    const card = { id: uid(), year, title, artist };
+    setPlayers((ps) => ps.map((p, i) => (i === turnIndex ? { ...p, timeline: [card] } : p)));
+    if (turnIndex + 1 < players.length) {
+      setTurnIndex((ti) => ti + 1);
+    } else {
+      setPhase("idle");
+      setTurnIndex(0);
+      setRound(1);
+      addLog("Minden kezdő kártya megvan — kezdődjön a játék!");
+    }
+  }
+
+  function beginDraw() {
+    setCurrentCard({}); // the actual card is whatever song/physical card the group is using - unknown to the app until reveal
+    setOwnSlot(null);
+    setStealAttempts([]);
+    setStealActorId(null);
+    setPendingAction("normal");
+    setRedeemPlayerId(null);
+    setRevealForm({ year: "", title: "", artist: "" });
+    setBonusGuess(false);
+    setPhase("placing");
+  }
+
+  function passCard() {
+    if (!current || (useTokens && current.tokens < 1)) return;
+    if (useTokens) {
+      setPlayers((ps) => ps.map((p) => (p.id === current.id ? { ...p, tokens: p.tokens - 1 } : p)));
+    }
+    addLog(`${current.name} passzolt egy kártyát${useTokens ? " (−1 zseton)" : ""}, és újat húz.`);
+    beginDraw();
+  }
+
+  // "Beváltás": any player - not just whoever's turn it is - may spend 3 tokens to claim the
+  // upcoming card before it's heard. Must happen before that card's song is played, i.e. only
+  // while we're still in the "idle" phase (nobody has started listening yet).
+  function beginRedeem(playerId) {
+    const buyer = players.find((p) => p.id === playerId);
+    if (!buyer || buyer.tokens < 3) return;
+    setPlayers((ps) => ps.map((p) => (p.id === playerId ? { ...p, tokens: p.tokens - 3 } : p)));
+    addLog(`${buyer.name} megveszi a következő számot 3 zsetonért, mielőtt az elhangozna.`);
+    setRedeemPlayerId(playerId);
+    setPendingAction("redeem");
+    setRevealForm({ year: "", title: "", artist: "" });
+    setBonusGuess(false);
+    setPhase("reveal_entry");
+  }
+
+  function chooseOwnSlot(slot) {
+    setOwnSlot(slot);
+    setPhase("steal_window");
+  }
+
+  function pickStealActor(playerId) {
+    setStealActorId(playerId);
+  }
+
+  function confirmStealSlot(slot) {
+    if (stealActorId == null) return;
+    const actor = players.find((p) => p.id === stealActorId);
+    if (!actor || (useTokens && actor.tokens < 1)) {
+      setStealActorId(null);
+      return;
+    }
+    if (stealAttempts.some((a) => a.slot === slot)) return;
+    const attempt = { id: uid(), playerId: stealActorId, slot };
+    setStealAttempts((a) => [...a, attempt]);
+    if (useTokens) {
+      setPlayers((ps) => ps.map((p) => (p.id === stealActorId ? { ...p, tokens: p.tokens - 1 } : p)));
+    }
+    addLog(`${actor.name} kiáltott: "HITSTER!"${useTokens ? " (−1 zseton)" : ""}`);
+    setStealActorId(null);
+  }
+
+  function cancelStealAttempt(attemptId) {
+    const att = stealAttempts.find((a) => a.id === attemptId);
+    if (!att) return;
+    setStealAttempts((a) => a.filter((x) => x.id !== attemptId));
+    if (useTokens) {
+      setPlayers((ps) => ps.map((p) => (p.id === att.playerId ? { ...p, tokens: p.tokens + 1 } : p)));
+    }
+  }
+
+  // Move from the steal window into "flip the card" mode: this is where the year actually gets entered.
+  function beginRevealEntry() {
+    setPendingAction("normal");
+    setRedeemPlayerId(null);
+    setRevealForm({ year: "", title: "", artist: "" });
+    setBonusGuess(false);
+    setPhase("reveal_entry");
+  }
+
+  function finishTurnCheckWin(winningPlayerIdMaybe, advanceTurn = true) {
+    setCurrentCard(null);
+    setOwnSlot(null);
+    setStealAttempts([]);
+    setStealActorId(null);
+    setPendingAction("normal");
+    setRedeemPlayerId(null);
+    setRevealForm({ year: "", title: "", artist: "" });
+    setBonusGuess(false);
+
+    setPlayers((ps) => {
+      const w = ps.find((p) => p.id === winningPlayerIdMaybe && p.timeline.length >= targetCards);
+      if (w) {
+        setWinner(w);
+        setPhase("won");
+      } else {
+        setPhase("idle");
+        if (advanceTurn) {
+          setTurnIndex((ti) => (ti + 1) % ps.length);
+          setRound((r) => r + 1);
+        }
+      }
+      return ps;
+    });
+  }
+
+  // Called once the year (and optionally title/artist) has been typed in at the reveal step.
+  // `override`, when provided (used when this action arrives from a remote client), supplies
+  // the typed values directly instead of reading local revealForm/bonusGuess state - this way
+  // we don't need to sync every keystroke across devices, only the final confirmed values.
+  function confirmReveal(override) {
+    const src = override || revealForm;
+    const useBonus = override ? !!override.bonusGuess : bonusGuess;
+    const year = parseInt(src.year, 10);
+    if (!Number.isFinite(year) || !current) return;
+    const title = (src.title || "").trim() || "Ismeretlen cím";
+    const artist = (src.artist || "").trim() || "Ismeretlen előadó";
+    const card = { id: uid(), year, title, artist };
+
+    if (pendingAction === "redeem") {
+      const buyerId = redeemPlayerId;
+      const buyer = players.find((p) => p.id === buyerId);
+      setPlayers((ps) => ps.map((p) => (p.id === buyerId ? { ...p, timeline: insertSorted(p.timeline, card) } : p)));
+      addLog(`"${title}" (${year}) automatikusan ${buyer ? buyer.name : "?"} idővonalára került (beváltás).`);
+      addLog(`A kör folytatódik — továbbra is ${current.name} jön.`);
+      finishTurnCheckWin(buyerId, false);
+      return;
+    }
+
+    const timeline = current.timeline;
+    const ownCorrect = checkSlot(timeline, ownSlot, year);
+
+    let winnerId = null;
+    if (ownCorrect) {
+      winnerId = current.id;
+    } else {
+      for (const att of stealAttempts) {
+        if (checkSlot(timeline, att.slot, year)) {
+          winnerId = att.playerId;
+          break;
+        }
+      }
+    }
+
+    setPlayers((ps) =>
+      ps.map((p) => {
+        let updated = p;
+        if (useBonus && useTokens && p.id === current.id) {
+          updated = { ...updated, tokens: updated.tokens + 1 };
+        }
+        if (winnerId && p.id === winnerId) {
+          updated = { ...updated, timeline: insertSorted(updated.timeline, card) };
+        }
+        return updated;
+      })
+    );
+
+    if (useBonus && useTokens) {
+      addLog(`${current.name} a saját körében eltalálta a címet/előadót is — +1 🪙 bónusz (a kártya sorsától függetlenül jár).`);
+    }
+
+    let msg;
+    if (winnerId === current.id) {
+      msg = { type: "correct", text: `Helyes! ${current.name} megtartja: "${card.title}" (${card.year}).` };
+      addLog(`${current.name} jól tette le: "${card.title}" (${card.year}).`);
+    } else if (winnerId) {
+      const stealer = players.find((p) => p.id === winnerId);
+      msg = { type: "stolen", text: `Ellopva! ${stealer.name} jól találta el: "${card.title}" (${card.year}).` };
+      addLog(`${stealer.name} sikeresen ellopta a kártyát ${current.name} idővonaláról: "${card.title}" (${card.year}).`);
+    } else {
+      msg = { type: "discard", text: `Senkinek sem sikerült: "${card.title}" (${card.year}) kikerül a játékból.` };
+      addLog(`Senki sem találta el: "${card.title}" (${card.year}) — a kártya kikerül a játékból.`);
+    }
+    setResult(msg);
+    setPhase("revealed");
+
+    setTimeout(() => {
+      setResult((r) => (r ? { ...r, winnerId } : r));
+    }, 0);
+  }
+
+  function nextAfterReveal() {
+    const winnerId = result && result.winnerId;
+    setResult(null);
+    finishTurnCheckWin(winnerId);
+  }
+
+  // ---------------- MULTIPLAYER (PeerJS / WebRTC) ----------------
+  // Host holds the authoritative game state and broadcasts a snapshot on every change.
+  // Clients never mutate game state directly - they send {type:'action', name, args} to the
+  // host, which runs the exact same local function, then the broadcast effect below ships the
+  // resulting state to everyone (including other clients).
+  function buildSnapshot(overrides) {
+    return {
+      screen,
+      players,
+      useTokens,
+      startTokens,
+      targetCards,
+      turnIndex,
+      phase,
+      currentCard,
+      ownSlot,
+      stealAttempts,
+      stealActorId,
+      pendingAction,
+      redeemPlayerId,
+      result,
+      winner,
+      log,
+      round,
+      presence,
+      hostUid: hostUidRef.current,
+      ...(overrides || {}),
+    };
+  }
+
+  function applyIncomingState(s) {
+    if (!s) return;
+    skipBroadcastRef.current = true;
+    setScreen(s.screen);
+    setPlayers(s.players || []);
+    setUseTokens(s.useTokens);
+    setStartTokens(s.startTokens);
+    setTargetCards(s.targetCards);
+    setTurnIndex(s.turnIndex || 0);
+    setPhase(s.phase || "idle");
+    setCurrentCard(s.currentCard || null);
+    setOwnSlot(s.ownSlot ?? null);
+    setStealAttempts(s.stealAttempts || []);
+    setStealActorId(s.stealActorId || null);
+    setPendingAction(s.pendingAction || "normal");
+    setRedeemPlayerId(s.redeemPlayerId || null);
+    setResult(s.result || null);
+    setWinner(s.winner || null);
+    setLog(s.log || []);
+    setRound(s.round || 1);
+    setPresence(s.presence || {});
+  }
+
+  const actionFns = {
+    beginDraw,
+    passCard,
+    beginRedeem,
+    chooseOwnSlot,
+    pickStealActor,
+    confirmStealSlot,
+    cancelStealAttempt,
+    beginRevealEntry,
+    confirmReveal,
+    nextAfterReveal,
+    submitStartingCard,
+    addPlayerToGame,
+    removePlayerFromGame,
+    beginGameFromLobby,
+  };
+
+  // Every interactive control in the game screen goes through this. The host runs actions
+  // locally (the broadcast effect below then writes the result). A client instead queues the
+  // action in a Firestore subcollection the host is listening to - clients never write the main
+  // room document directly, only the host does (see the Firestore rules note in the reply).
+  function callAction(name, ...args) {
+    if (mpRole === "client" && roomRefRef.current) {
+      roomRefRef.current
+        .collection("actions")
+        .add({ name, args, actorUid: myUidRef.current || null, ts: Date.now() })
+        .catch(() => {
+          setMpError("Nem sikerült elküldeni a lépést a hostnak.");
+        });
+      return;
+    }
+    const fn = actionFns[name];
+    if (fn) fn(...args);
+  }
+
+  function teardownMp() {
+    if (unsubscribeRef.current) {
+      try {
+        unsubscribeRef.current();
+      } catch (e) {}
+      unsubscribeRef.current = null;
+    }
+    if (unsubscribeActionsRef.current) {
+      try {
+        unsubscribeActionsRef.current();
+      } catch (e) {}
+      unsubscribeActionsRef.current = null;
+    }
+    roomRefRef.current = null;
+    hostUidRef.current = null;
+    setMpRole(null);
+    setMpStatus("idle");
+    setMpError("");
+    setMpCode("");
+    setMyPlayerId(null);
+  }
+
+  function subscribeToRoom(ref) {
+    if (unsubscribeRef.current) {
+      try {
+        unsubscribeRef.current();
+      } catch (e) {}
+    }
+    unsubscribeRef.current = ref.onSnapshot(
+      (docSnap) => {
+        if (docSnap.exists) applyIncomingState(docSnap.data());
+      },
+      () => {
+        setMpError("Megszakadt a kapcsolat a szobával.");
+      }
+    );
+  }
+
+  // Host only: watch the actions queue, apply each action exactly like a local click would,
+  // then delete it. Because only the host writes the main room doc, this is the only path
+  // through which a client's action actually changes the shared game state.
+  function subscribeToActions(ref) {
+    if (unsubscribeActionsRef.current) {
+      try {
+        unsubscribeActionsRef.current();
+      } catch (e) {}
+    }
+    unsubscribeActionsRef.current = ref.collection("actions").onSnapshot((snap) => {
+      snap.docChanges().forEach((change) => {
+        if (change.type !== "added") return;
+        const data = change.doc.data();
+        const fn = actionFns[data.name];
+        if (fn) fn(...(data.args || []));
+        change.doc.ref.delete().catch(() => {});
+      });
+    });
+  }
+
+  function startHosting(overrides) {
+    const db = ensureFirestore();
+    if (!db) {
+      setMpError("A többjátékos modul (Firebase) nem töltődött be. Ellenőrizd az internetkapcsolatot, és próbáld újra.");
+      setMpStatus("error");
+      return;
+    }
+    setMpStatus("connecting");
+    ensureAuth()
+      .then((uid) => {
+        myUidRef.current = uid;
+        hostUidRef.current = uid;
+        const code = String(Math.floor(1000 + Math.random() * 9000));
+        const ref = db.collection("rooms").doc(code);
+        roomRefRef.current = ref;
+        withTimeout(
+          ref.set(buildSnapshot({ ...overrides, hostUid: uid })),
+          10000,
+          "Időtúllépés a szoba írásakor (10mp) - ellenőrizd a Firestore szabályokat és az internetkapcsolatot."
+        )
+          .then(() => {
+            setMpCode(code);
+            setMpStatus("connected");
+            setMpRole("host");
+            subscribeToRoom(ref);
+            subscribeToActions(ref);
+          })
+          .catch((err) => {
+            setMpError("Nem sikerült szobát létrehozni: " + (err && err.message ? err.message : err));
+            setMpStatus("error");
+          });
+      })
+      .catch((err) => {
+        setMpError("Bejelentkezési hiba: " + (err && err.message ? err.message : err));
+        setMpStatus("error");
+      });
+  }
+
+  function joinRoom() {
+    const db = ensureFirestore();
+    if (!db) {
+      setMpError("A többjátékos modul (Firebase) nem töltődött be. Ellenőrizd az internetkapcsolatot, és próbáld újra.");
+      setMpStatus("error");
+      return;
+    }
+    const code = joinCodeInput.trim();
+    if (!/^\d{4}$/.test(code)) {
+      setMpError("A kód 4 számjegyből áll.");
+      return;
+    }
+    setMpError("");
+    setMpStatus("connecting");
+    ensureAuth()
+      .then((uid) => {
+        myUidRef.current = uid;
+        const ref = db.collection("rooms").doc(code);
+        withTimeout(
+          ref.get(),
+          10000,
+          "Időtúllépés a szoba keresésekor (10mp) - ellenőrizd a Firestore szabályokat és az internetkapcsolatot."
+        )
+          .then((docSnap) => {
+            if (!docSnap.exists) {
+              setMpError("Nincs ilyen kódú szoba.");
+              setMpStatus("error");
+              return;
+            }
+            roomRefRef.current = ref;
+            applyIncomingState(docSnap.data());
+            setMpCode(code);
+            setMpStatus("connected");
+            setMpRole("client");
+            subscribeToRoom(ref);
+          })
+          .catch((err) => {
+            setMpError("Csatlakozási hiba: " + (err && err.message ? err.message : err));
+            setMpStatus("error");
+          });
+      })
+      .catch((err) => {
+        setMpError("Bejelentkezési hiba: " + (err && err.message ? err.message : err));
+        setMpStatus("error");
+      });
+  }
+
+  // Whenever local game state changes, the HOST pushes the full snapshot to the shared room
+  // document. Clients never write the main doc (see callAction) - they only ever read it via
+  // subscribeToRoom, so this effect intentionally does nothing for them.
+  useEffect(() => {
+    if (!roomRefRef.current || mpRole !== "host") return;
+    if (skipBroadcastRef.current) {
+      skipBroadcastRef.current = false;
+      return;
+    }
+    const snapshot = buildSnapshot();
+    roomRefRef.current.set(snapshot).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    screen,
+    players,
+    useTokens,
+    startTokens,
+    targetCards,
+    turnIndex,
+    phase,
+    currentCard,
+    ownSlot,
+    stealAttempts,
+    stealActorId,
+    pendingAction,
+    redeemPlayerId,
+    result,
+    winner,
+    log,
+    presence,
+    round,
+  ]);
+
+  // Presence heartbeat: while connected to a multiplayer room, periodically stamp "I'm still
+  // here" for my own player id, so other devices can tell if someone has left.
+  useEffect(() => {
+    if (!mpRole || !myPlayerId) return;
+    const beat = () => setPresence((p) => ({ ...p, [myPlayerId]: Date.now() }));
+    beat();
+    const interval = setInterval(beat, 6000);
+    return () => clearInterval(interval);
+  }, [mpRole, myPlayerId]);
+
+  // Re-render periodically so "X hasn't been seen in a while" staleness checks stay current
+  // even when nothing else about the game state changes.
+  useEffect(() => {
+    const interval = setInterval(() => setNowTick(Date.now()), 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ---------------- RENDER ----------------
+  if (screen === "menu") {
+    return (
+      <div className="hs-root">
+        <GlobalStyle />
+        <div className="hs-setup-wrap">
+          <div className="hs-logo">
+            <span className="hs-logo-dot" style={{ background: "var(--pink)" }} />
+            <span className="hs-logo-dot" style={{ background: "var(--yellow)" }} />
+            <span className="hs-logo-dot" style={{ background: "var(--teal)" }} />
+            <span className="hs-logo-dot" style={{ background: "var(--purple)" }} />
+            <h1>HITSTER</h1>
+            <div className="hs-logo-sub">Játékmenet-vezető</div>
+          </div>
+
+          {(players.length > 0 || hasSavedGame) && (
+            <div className="hs-setup-card hs-continue-card">
+              <p className="hs-deck-hint" style={{ margin: "0 0 10px" }}>
+                {players.length > 0 ? "Van egy folyamatban lévő játékod." : "Találtunk egy korábban elmentett játékot."}
+              </p>
+              <button
+                className="hs-start-btn"
+                onClick={players.length > 0 ? resumeInMemoryGame : resumeSavedGame}
+              >
+                ▶ Folytatás
+              </button>
+            </div>
+          )}
+
+          <div className="hs-setup-card">
+            <h2>Játékmód</h2>
+            <div className="hs-mode-tabs">
+              <button
+                className={`hs-mode-tab ${mpIntent === "local" ? "active" : ""}`}
+                onClick={() => {
+                  setMpIntent("local");
+                  setMpError("");
+                }}
+              >
+                Egy eszközön
+              </button>
+              <button
+                className={`hs-mode-tab ${mpIntent === "host" ? "active" : ""}`}
+                onClick={() => {
+                  setMpIntent("host");
+                  setMpError("");
+                }}
+              >
+                Host
+              </button>
+              <button
+                className={`hs-mode-tab ${mpIntent === "join" ? "active" : ""}`}
+                onClick={() => {
+                  setMpIntent("join");
+                  setMpError("");
+                }}
+              >
+                Csatlakozás
+              </button>
+            </div>
+            {mpIntent === "host" && (
+              <p className="hs-deck-hint" style={{ marginTop: 10 }}>
+                A következő lépésben kapsz egy 4 jegyű kódot — ezt a többiek beírhatják a saját telefonjukon, hogy
+                csatlakozzanak, és mindenki saját maga adja meg a nevét.
+              </p>
+            )}
+            {mpIntent === "join" && (
+              <p className="hs-deck-hint" style={{ marginTop: 10 }}>
+                Kérd el a kódot attól, aki a hostot indította a saját eszközén.
+              </p>
+            )}
+          </div>
+
+          {mpIntent === "join" ? (
+            <div className="hs-setup-card">
+              <h2>Csatlakozás</h2>
+              <div className="hs-setup-row">
+                <input
+                  className="hs-year-input"
+                  style={{ width: 120 }}
+                  placeholder="4 jegyű kód"
+                  value={joinCodeInput}
+                  onChange={(e) => setJoinCodeInput(e.target.value.replace(/\D/g, "").slice(0, 4))}
+                />
+                <button className="hs-primary-btn" disabled={mpStatus === "connecting"} onClick={joinRoom}>
+                  {mpStatus === "connecting" ? "Csatlakozás…" : "Csatlakozás"}
+                </button>
+              </div>
+              {mpError && <p className="hs-mp-error">{mpError}</p>}
+            </div>
+          ) : (
+            <div className="hs-setup-card">
+              <h2>Beállítások</h2>
+              <div className="hs-setup-options">
+                <label className="hs-checkbox">
+                  <input type="checkbox" checked={useTokens} onChange={(e) => setUseTokens(e.target.checked)} />
+                  HITSTER zsetonok használata
+                </label>
+                {useTokens && (
+                  <label className="hs-number-field">
+                    Kezdő zsetonok
+                    <input type="number" min={0} max={9} value={startTokens} onChange={(e) => setStartTokens(e.target.value)} />
+                  </label>
+                )}
+                <label className="hs-number-field">
+                  Győzelemhez szükséges kártyák
+                  <input
+                    type="number"
+                    min={3}
+                    max={30}
+                    value={targetCards}
+                    onChange={(e) => setTargetCards(parseInt(e.target.value, 10) || 10)}
+                  />
+                </label>
+              </div>
+              {mpError && <p className="hs-mp-error">{mpError}</p>}
+              <button className="hs-start-btn" onClick={proceedToLobby}>
+                {mpIntent === "host" ? "Szoba létrehozása →" : "Tovább a játékosokhoz →"}
+              </button>
+            </div>
+          )}
+
+          <button className="hs-manage-link" onClick={() => setScreen("manage")}>
+            👤 Játékosok kezelése
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- MANAGE PLAYERS SCREEN: a persistent roster, independent of any single game ----
+  if (screen === "manage") {
+    return (
+      <div className="hs-root">
+        <GlobalStyle />
+        <div className="hs-setup-wrap">
+          <div className="hs-logo">
+            <h1>HITSTER</h1>
+            <div className="hs-logo-sub">Játékosok kezelése</div>
+          </div>
+
+          <div className="hs-setup-card">
+            <button className="hs-back-btn" onClick={() => setScreen("menu")}>
+              ← Vissza a főmenübe
+            </button>
+            <h2 style={{ marginTop: 14 }}>Mentett játékosok</h2>
+            {savedPlayers.length > 0 ? (
+              <div className="hs-lobby-players">
+                {savedPlayers.map((p, i) => {
+                  const c = playerColor(i);
+                  return (
+                    <div className="hs-lobby-chip" key={p.id} style={{ borderColor: c.solid }}>
+                      <span className="hs-swatch" style={{ background: c.solid }} />
+                      {p.name}
+                      <button className="hs-icon-btn" onClick={() => removeSavedPlayer(p.id)} aria-label="Törlés">
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="hs-deck-hint">Még nincs mentett játékos.</p>
+            )}
+            <div className="hs-setup-row" style={{ marginTop: 14 }}>
+              <input
+                placeholder="Új játékos neve"
+                value={manageNewName}
+                onChange={(e) => setManageNewName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key !== "Enter" || !manageNewName.trim()) return;
+                  rememberPlayer(manageNewName);
+                  setManageNewName("");
+                }}
+              />
+              <button
+                className="hs-primary-btn"
+                disabled={!manageNewName.trim()}
+                onClick={() => {
+                  rememberPlayer(manageNewName);
+                  setManageNewName("");
+                }}
+              >
+                Hozzáadás
+              </button>
+            </div>
+            <p className="hs-deck-hint" style={{ marginTop: 10 }}>
+              Ez a lista csak ezen az eszközön él, és bármelyik új játék indításakor egy kattintással felvehető
+              belőle bárki.
+            </p>
+          </div>
+
+          <div className="hs-setup-card">
+            <h2>Csapatok</h2>
+            {savedTeams.length > 0 ? (
+              <div className="hs-lobby-players">
+                {savedTeams.map((t, i) => {
+                  const c = playerColor(i);
+                  return (
+                    <div className="hs-lobby-chip" key={t.id} style={{ borderColor: c.solid }}>
+                      👥 {t.name}
+                      <button className="hs-icon-btn" onClick={() => removeSavedTeam(t.id)} aria-label="Törlés">
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="hs-deck-hint">Még nincs mentett csapat.</p>
+            )}
+
+            {savedPlayers.length >= 2 ? (
+              <>
+                <p className="hs-deck-hint" style={{ margin: "14px 0 8px" }}>
+                  Válaszd ki a csapat tagjait (legalább 2 fő):
+                </p>
+                <div className="hs-saved-names">
+                  {savedPlayers.map((p) => (
+                    <button
+                      key={p.id}
+                      className={`hs-name-chip ${teamMemberIds.includes(p.id) ? "selected" : ""}`}
+                      onClick={() => toggleTeamMember(p.id)}
+                    >
+                      {p.name}
+                    </button>
+                  ))}
+                </div>
+                <div className="hs-setup-row" style={{ marginTop: 10 }}>
+                  <input
+                    placeholder={teamMemberIds.length >= 2 ? teamDefaultName(teamMemberIds) : "Csapatnév (opcionális)"}
+                    value={teamNameInput}
+                    onChange={(e) => setTeamNameInput(e.target.value)}
+                  />
+                  <button className="hs-primary-btn" disabled={teamMemberIds.length < 2} onClick={createTeam}>
+                    Csapat létrehozása
+                  </button>
+                </div>
+                <p className="hs-deck-hint" style={{ marginTop: 8 }}>
+                  Ha nem adsz meg nevet, alapértelmezetten "A játékos & B játékos" formában nevezzük el a csapatot.
+                </p>
+              </>
+            ) : (
+              <p className="hs-deck-hint" style={{ marginTop: 12 }}>
+                Legalább 2 mentett játékos kell egy csapat létrehozásához.
+              </p>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- LOBBY SCREEN: assemble this game's players and turn order before starting ----
+  if (screen === "lobby") {
+    const iHaveJoined = mpRole && myPlayerId && players.some((p) => p.id === myPlayerId);
+    const availableSaved = savedPlayers.filter((sp) => !players.some((p) => p.name === sp.name));
+    const availableTeams = savedTeams.filter((t) => !players.some((p) => p.name === t.name));
+    const manualIsTeam = gameType === "team" ? true : gameType === "individual" ? false : manualEntryType === "team";
+    const canEditOrder = !mpRole || mpRole === "host";
+    return (
+      <div className="hs-root">
+        <GlobalStyle />
+        <div className="hs-setup-wrap">
+          <div className="hs-logo">
+            <span className="hs-logo-dot" style={{ background: "var(--pink)" }} />
+            <span className="hs-logo-dot" style={{ background: "var(--yellow)" }} />
+            <span className="hs-logo-dot" style={{ background: "var(--teal)" }} />
+            <span className="hs-logo-dot" style={{ background: "var(--purple)" }} />
+            <h1>HITSTER</h1>
+            <div className="hs-logo-sub">Játékosok</div>
+          </div>
+
+          <div className="hs-setup-card">
+            <div className="hs-lobby-top-row">
+              <button className="hs-back-btn" onClick={backToMenu}>
+                ← Vissza a főmenübe
+              </button>
+              {mpRole === "client" && (
+                <span className="hs-mp-badge">
+                  Szoba: <strong>{mpCode}</strong> · {mpStatus === "connected" ? "szinkronban" : "kapcsolódás…"}
+                </span>
+              )}
+            </div>
+          </div>
+
+          {mpRole === "host" && (
+            <div className="hs-setup-card hs-room-code-card">
+              <p className="hs-deck-hint">Szobakód — ezt add meg a többieknek</p>
+              <div className="hs-room-code-big">{mpCode}</div>
+              <p className="hs-deck-hint">élő szinkron</p>
+            </div>
+          )}
+
+          {mpIntent === "host" && mpRole !== "host" && (
+            <div className="hs-setup-card">
+              {mpStatus === "connecting" && <p className="hs-deck-hint">Szoba létrehozása…</p>}
+              {mpStatus === "error" && (
+                <>
+                  <p className="hs-mp-error">{mpError || "Nem sikerült szobát létrehozni."}</p>
+                  <button
+                    className="hs-primary-btn"
+                    style={{ marginTop: 8 }}
+                    onClick={() => startHosting({ screen: "lobby", players: [] })}
+                  >
+                    Újra próbálom
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          <div className="hs-setup-card">
+            <h2>Játéktípus</h2>
+            <div className="hs-mode-tabs">
+              <button className={`hs-mode-tab ${gameType === "individual" ? "active" : ""}`} onClick={() => setGameType("individual")}>
+                Egyéni
+              </button>
+              <button className={`hs-mode-tab ${gameType === "team" ? "active" : ""}`} onClick={() => setGameType("team")}>
+                Csapat
+              </button>
+              <button className={`hs-mode-tab ${gameType === "mixed" ? "active" : ""}`} onClick={() => setGameType("mixed")}>
+                Vegyes
+              </button>
+            </div>
+          </div>
+
+          <div className="hs-setup-card">
+            <h2>Játékosok</h2>
+
+            {players.length > 0 && (
+              <div className="hs-lobby-players">
+                {players.map((p, i) => {
+                  const c = playerColor(i);
+                  return (
+                    <div className="hs-lobby-chip" key={p.id} style={{ borderColor: c.solid }}>
+                      <span className="hs-swatch" style={{ background: c.solid }} />
+                      {p.name}
+                      {p.id === myPlayerId && <span className="hs-me-badge">TE</span>}
+                      {mpRole && p.ready && <span className="hs-ready-badge">✓ kész</span>}
+                      {(!mpRole || p.id === myPlayerId) && (
+                        <button className="hs-icon-btn" onClick={() => removePlayerFromGame(p.id)} aria-label="Eltávolítás">
+                          ×
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {mpRole && iHaveJoined ? (
+              <p className="hs-deck-hint" style={{ marginTop: 12 }}>
+                Csatlakoztál. Várj a többiekre, vagy indítsátok el a játékot, ha mindenki készen áll.
+              </p>
+            ) : (
+              <>
+                {gameType !== "team" && availableSaved.length > 0 && (
+                  <>
+                    <p className="hs-deck-hint" style={{ margin: "4px 0 6px" }}>
+                      Mentett játékosok — kattints a hozzáadáshoz:
+                    </p>
+                    <div className="hs-saved-names">
+                      {availableSaved.map((sp) => (
+                        <button
+                          key={sp.id}
+                          className="hs-name-chip"
+                          onClick={() => (mpRole ? setNewPlayerName(sp.name) : addSavedPlayerToGame(sp))}
+                        >
+                          {sp.name}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+                {gameType !== "individual" && availableTeams.length > 0 && (
+                  <>
+                    <p className="hs-deck-hint" style={{ margin: "10px 0 6px" }}>
+                      Mentett csapatok — kattints a hozzáadáshoz:
+                    </p>
+                    <div className="hs-saved-names">
+                      {availableTeams.map((t) => (
+                        <button
+                          key={t.id}
+                          className="hs-name-chip"
+                          onClick={() => (mpRole ? setNewPlayerName(t.name) : addSavedTeamToGame(t))}
+                        >
+                          👥 {t.name}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+                {gameType === "team" && availableTeams.length === 0 && (
+                  <p className="hs-deck-hint" style={{ margin: "4px 0" }}>
+                    Nincs még mentett csapat — hozz létre egyet a Játékosok kezelése menüben.
+                  </p>
+                )}
+
+                {gameType === "mixed" && (
+                  <div className="hs-mode-tabs" style={{ marginTop: 10 }}>
+                    <button
+                      className={`hs-mode-tab ${manualEntryType === "individual" ? "active" : ""}`}
+                      onClick={() => setManualEntryType("individual")}
+                    >
+                      Új név: Egyéni
+                    </button>
+                    <button
+                      className={`hs-mode-tab ${manualEntryType === "team" ? "active" : ""}`}
+                      onClick={() => setManualEntryType("team")}
+                    >
+                      Új név: Csapat
+                    </button>
+                  </div>
+                )}
+
+                <div className="hs-setup-row" style={{ marginTop: 10 }}>
+                  <input
+                    placeholder={
+                      mpRole ? "A te neved" : manualIsTeam ? "Új csapat neve" : "Új játékos neve"
+                    }
+                    value={newPlayerName}
+                    onChange={(e) => setNewPlayerName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key !== "Enter" || !newPlayerName.trim()) return;
+                      if (mpRole) joinAsPlayer(newPlayerName, saveNewToRoster, manualIsTeam);
+                      else addPlayerToGame(newPlayerName, saveNewToRoster, manualIsTeam);
+                      if (!mpRole) setNewPlayerName("");
+                    }}
+                  />
+                  <button
+                    className="hs-primary-btn"
+                    disabled={!newPlayerName.trim()}
+                    onClick={() => {
+                      if (mpRole) joinAsPlayer(newPlayerName, saveNewToRoster, manualIsTeam);
+                      else {
+                        addPlayerToGame(newPlayerName, saveNewToRoster, manualIsTeam);
+                        setNewPlayerName("");
+                      }
+                    }}
+                  >
+                    {mpRole ? "Csatlakozom" : "Hozzáadás"}
+                  </button>
+                </div>
+                <label className="hs-checkbox" style={{ marginTop: 8 }}>
+                  <input type="checkbox" checked={saveNewToRoster} onChange={(e) => setSaveNewToRoster(e.target.checked)} />
+                  Új név mentése a névsorba is ({manualIsTeam ? "csapatként" : "játékosként"})
+                </label>
+              </>
+            )}
+
+            <p className="hs-deck-hint" style={{ marginTop: 12 }}>
+              {players.length < 2 ? "Legalább 2 játékos kell az induláshoz." : `${players.length} játékos kész.`}
+            </p>
+          </div>
+
+          {players.length >= 2 && (
+            <div className="hs-setup-card">
+              <h2>Ki kezd, milyen sorrendben</h2>
+              <div className="hs-order-list">
+                {players.map((p, i) => {
+                  const c = playerColor(i);
+                  return (
+                    <div className="hs-order-row" key={p.id}>
+                      <span className="hs-order-num">{i + 1}.</span>
+                      <span className="hs-swatch" style={{ background: c.solid }} />
+                      <span className="hs-order-name">
+                        {p.name}
+                        {i === 0 && <span className="hs-kezd-badge" style={{ marginLeft: 6 }}>KEZD</span>}
+                      </span>
+                      {canEditOrder && (
+                        <div className="hs-order-arrows">
+                          <button className="hs-icon-btn" disabled={i === 0} onClick={() => movePlayerOrder(p.id, -1)} aria-label="Feljebb">
+                            ▲
+                          </button>
+                          <button
+                            className="hs-icon-btn"
+                            disabled={i === players.length - 1}
+                            onClick={() => movePlayerOrder(p.id, 1)}
+                            aria-label="Lejjebb"
+                          >
+                            ▼
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {canEditOrder ? (
+                <button className="hs-ghost-btn" style={{ marginTop: 10 }} onClick={shufflePlayerOrder}>
+                  🎲 Sorrend sorsolása
+                </button>
+              ) : (
+                <p className="hs-deck-hint" style={{ marginTop: 10 }}>
+                  A sorrendet csak a host módosíthatja.
+                </p>
+              )}
+            </div>
+          )}
+
+          {(!mpRole || mpRole === "host") ? (
+            <button className="hs-start-btn" disabled={players.length < 2} onClick={beginGameFromLobby}>
+              Játék indítása →
+            </button>
+          ) : (
+            myPlayerId && (
+              <button
+                className={`hs-start-btn ${players.find((p) => p.id === myPlayerId)?.ready ? "hs-ready-active" : ""}`}
+                onClick={toggleMyReady}
+              >
+                {players.find((p) => p.id === myPlayerId)?.ready ? "✓ Készen állok" : "Készen állok"}
+              </button>
+            )
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ---- GAME SCREEN ----
+  return (
+    <div className="hs-root">
+      <GlobalStyle />
+      <header className="hs-header">
+        <div className="hs-header-logo">
+          <span className="hs-logo-dot small" style={{ background: "var(--pink)" }} />
+          <span className="hs-logo-dot small" style={{ background: "var(--yellow)" }} />
+          <span className="hs-logo-dot small" style={{ background: "var(--teal)" }} />
+          <strong>HITSTER</strong>
+        </div>
+        <div className="hs-header-meta">
+          {round}. kör · Összesen {players.reduce((sum, p) => sum + p.timeline.length, 0)} kártya az idővonalakon · Cél:{" "}
+          {targetCards} kártya
+        </div>
+        {mpRole === "host" && (
+          <span className="hs-mp-badge">
+            Szoba: <strong>{mpCode}</strong> · élő szinkron
+          </span>
+        )}
+        {mpRole === "client" && (
+          <span className="hs-mp-badge">
+            Szoba: <strong>{mpCode}</strong> · {mpStatus === "connected" ? "szinkronban" : "kapcsolódás…"}
+          </span>
+        )}
+        {(mpRole === "host" || mpRole === "client") && players.length > 0 && (
+          <select
+            className="hs-mp-identity"
+            value={myPlayerId || ""}
+            disabled={!!myPlayerId}
+            onChange={(e) => setMyPlayerId(e.target.value || null)}
+          >
+            <option value="">Ki vagy te?</option>
+            {players.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        )}
+        {myPlayerId && (
+          <button
+            className="hs-jump-btn"
+            onClick={() => {
+              const el = document.getElementById("my-timeline-row");
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+            }}
+          >
+            📍 Az enyém
+          </button>
+        )}
+        <button className="hs-back-btn" onClick={pauseGameToMenu}>
+          ← Főmenü
+        </button>
+        <button className="hs-reset-btn" onClick={resetGame}>
+          Új játék
+        </button>
+      </header>
+
+      {winner ? (
+        <WinnerBanner winner={winner} onRestart={resetGame} />
+      ) : (
+        <>
+          <PlayerStrip players={players} turnIndex={turnIndex} useTokens={useTokens} />
+
+          <main className="hs-main">
+            <section className="hs-turntable">
+              <Turntable
+                current={current}
+                phase={phase}
+                useTokens={useTokens}
+                onDraw={() => callAction("beginDraw")}
+                onPass={() => callAction("passCard")}
+                onBeginRedeem={(playerId) => callAction("beginRedeem", playerId)}
+                result={result}
+                onBeginRevealEntry={() => callAction("beginRevealEntry")}
+                onConfirmReveal={(override) => callAction("confirmReveal", override)}
+                revealForm={revealForm}
+                setRevealForm={setRevealForm}
+                pendingAction={pendingAction}
+                redeemPlayerId={redeemPlayerId}
+                bonusGuess={bonusGuess}
+                setBonusGuess={setBonusGuess}
+                onNext={() => callAction("nextAfterReveal")}
+                stealAttempts={stealAttempts}
+                players={players}
+                stealActorId={stealActorId}
+                onPickStealActor={(playerId) => callAction("pickStealActor", playerId)}
+                onCancelSteal={(attemptId) => callAction("cancelStealAttempt", attemptId)}
+                ownSlot={ownSlot}
+                onSubmitStartingCard={(form) => callAction("submitStartingCard", form)}
+                mpRole={mpRole}
+                myPlayerId={myPlayerId}
+              />
+            </section>
+
+            <section className="hs-timelines">
+              {orderPlayersForDisplay(players, myPlayerId, current && current.id).map((p) => {
+                const originalIndex = players.findIndex((x) => x.id === p.id);
+                const isTurnPlayer = current && p.id === current.id;
+                const myDeviceIsTurnPlayer = !mpRole || myPlayerId === (current && current.id);
+                const myDeviceIsStealer = stealActorId && (!mpRole || myPlayerId === stealActorId);
+                const isOffline = mpRole && presence[p.id] && nowTick - presence[p.id] > 15000;
+                return (
+                  <div key={p.id} id={p.id === myPlayerId ? "my-timeline-row" : undefined}>
+                    <TimelineRow
+                      player={p}
+                      index={originalIndex}
+                      isCurrent={isTurnPlayer}
+                      isMe={p.id === myPlayerId}
+                      isOffline={isOffline}
+                      interactive={
+                        isTurnPlayer &&
+                        ((phase === "placing" && myDeviceIsTurnPlayer) || (phase === "steal_window" && myDeviceIsStealer))
+                      }
+                      ownSlot={isTurnPlayer ? ownSlot : null}
+                      stealAttempts={isTurnPlayer ? stealAttempts : []}
+                      playersAll={players}
+                      onGapClick={(slot) => {
+                        if (phase === "placing" && isTurnPlayer && myDeviceIsTurnPlayer) callAction("chooseOwnSlot", slot);
+                        else if (phase === "steal_window" && isTurnPlayer && myDeviceIsStealer) callAction("confirmStealSlot", slot);
+                      }}
+                    />
+                  </div>
+                );
+              })}
+            </section>
+          </main>
+
+          <LogPanel log={log} />
+        </>
+      )}
+    </div>
+  );
+}
+
+function orderPlayersForDisplay(players, myPlayerId, currentTurnId) {
+  const turnP = players.filter((p) => p.id === currentTurnId);
+  const mine = myPlayerId && myPlayerId !== currentTurnId ? players.filter((p) => p.id === myPlayerId) : [];
+  const rest = players.filter((p) => p.id !== currentTurnId && p.id !== myPlayerId);
+  return [...turnP, ...mine, ...rest];
+}
+
+// ---------------- SUBCOMPONENTS ----------------
+
+function PlayerStrip({ players, turnIndex, useTokens }) {
+  return (
+    <div className="hs-player-strip">
+      {players.map((p, i) => {
+        const c = playerColor(i);
+        const isCurrent = i === turnIndex;
+        return (
+          <div className={`hs-player-chip ${isCurrent ? "is-current" : ""}`} key={p.id} style={{ "--pc": c.solid }}>
+            <span className="hs-swatch" style={{ background: c.solid }} />
+            <span className="hs-player-name">{p.name}</span>
+            <span className="hs-player-count">{p.timeline.length} kártya</span>
+            {useTokens && <span className="hs-token-count">🪙 {p.tokens}</span>}
+            {isCurrent && <span className="hs-turn-badge">Ő jön</span>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function Turntable({
+  current,
+  phase,
+  useTokens,
+  onDraw,
+  onPass,
+  onBeginRedeem,
+  result,
+  onBeginRevealEntry,
+  onConfirmReveal,
+  revealForm,
+  setRevealForm,
+  pendingAction,
+  onNext,
+  stealAttempts,
+  players,
+  stealActorId,
+  onPickStealActor,
+  onCancelSteal,
+  ownSlot,
+  bonusGuess,
+  setBonusGuess,
+  redeemPlayerId,
+  onSubmitStartingCard,
+  mpRole,
+  myPlayerId,
+}) {
+  const spinning = phase === "placing" || phase === "steal_window" || phase === "reveal_entry";
+  const revealYearValid = revealForm.year !== "" && Number.isFinite(parseInt(revealForm.year, 10));
+  const buyer = redeemPlayerId ? players.find((p) => p.id === redeemPlayerId) : null;
+  const [startCardForm, setStartCardForm] = useState({ year: "", title: "", artist: "" });
+  const startCardYearValid = startCardForm.year !== "" && Number.isFinite(parseInt(startCardForm.year, 10));
+
+  // Who is entitled to fill in / confirm the reveal step right now (the rest can only watch).
+  const canActAsMyself = (id) => !mpRole || myPlayerId === id;
+  const canEditReveal =
+    phase === "starting_card"
+      ? canActAsMyself(current && current.id)
+      : phase === "reveal_entry"
+      ? pendingAction === "redeem"
+        ? canActAsMyself(redeemPlayerId)
+        : canActAsMyself(current && current.id)
+      : true;
+
+  let headline = null;
+  if (phase === "starting_card" && current) {
+    headline = (
+      <>
+        <strong style={{ color: "var(--pink)" }}>{current.name}</strong> — töltsd ki a kezdő kártyád adatait
+      </>
+    );
+  } else if (phase === "idle" && current) {
+    headline = (
+      <>
+        Soron: <strong style={{ color: "var(--pink)" }}>{current.name}</strong>
+      </>
+    );
+  } else if (phase === "placing" && current) {
+    headline = (
+      <>
+        <strong style={{ color: "var(--pink)" }}>{current.name}</strong> — válassz helyet lent ⬇
+      </>
+    );
+  } else if (phase === "steal_window" && current) {
+    headline = stealActorId ? (
+      <>Válassz helyet {current.name} idővonalán lent ⬇</>
+    ) : (
+      <>{current.name} tippje rögzítve. Ki kiált „HITSTER”?</>
+    );
+  } else if (phase === "reveal_entry") {
+    headline =
+      pendingAction === "redeem"
+        ? `Beváltás — ${buyer ? buyer.name : "?"} veszi meg. Add meg a szám adatait:`
+        : "Fordítsd meg a kártyát — add meg az adatait:";
+  } else if (phase === "revealed" && result) {
+    headline = result.text;
+  }
+
+  return (
+    <div className="hs-deck">
+      <div className="hs-deck-top">
+        <div className={`hs-vinyl ${spinning ? "spin" : ""} ${phase === "revealed" ? "flip" : ""}`}>
+          <div className="hs-vinyl-label">
+            {phase === "revealed" && result ? (
+              <div className="hs-vinyl-year">{result.text.match(/\((\d{4})\)/) ? result.text.match(/\((\d{4})\)/)[1] : ""}</div>
+            ) : phase === "idle" ? (
+              <div className="hs-vinyl-idle">?</div>
+            ) : (
+              <div className="hs-vinyl-idle">♪</div>
+            )}
+          </div>
+        </div>
+        {headline && (
+          <p className={`hs-deck-turn ${phase === "revealed" && result ? `hs-result-${result.type}` : ""}`}>{headline}</p>
+        )}
+      </div>
+
+      <div className="hs-deck-panel">
+        {phase === "starting_card" && current && (
+          <div className="hs-form">
+            {canEditReveal ? (
+              <>
+                <div className="hs-form-row">
+                  <input
+                    className="hs-year-input"
+                    type="number"
+                    placeholder="Év *"
+                    value={startCardForm.year}
+                    onChange={(e) => setStartCardForm((f) => ({ ...f, year: e.target.value }))}
+                    autoFocus
+                  />
+                  <input
+                    placeholder="Cím (opcionális)"
+                    value={startCardForm.title}
+                    onChange={(e) => setStartCardForm((f) => ({ ...f, title: e.target.value }))}
+                  />
+                  <input
+                    placeholder="Előadó (opcionális)"
+                    value={startCardForm.artist}
+                    onChange={(e) => setStartCardForm((f) => ({ ...f, artist: e.target.value }))}
+                  />
+                </div>
+                <button
+                  className="hs-primary-btn"
+                  disabled={!startCardYearValid}
+                  onClick={() => {
+                    onSubmitStartingCard(startCardForm);
+                    setStartCardForm({ year: "", title: "", artist: "" });
+                  }}
+                >
+                  Kész
+                </button>
+              </>
+            ) : (
+              <p className="hs-deck-hint">Várakozás, amíg {current.name} kitölti a saját kezdő kártyáját…</p>
+            )}
+          </div>
+        )}
+
+        {phase === "idle" && current && (
+          <div className="hs-form">
+            <button className="hs-primary-btn" onClick={onDraw}>
+              Új kártya húzása
+            </button>
+            {useTokens && players.some((p) => p.tokens >= 3) && (
+              <div style={{ marginTop: 10 }}>
+                <p className="hs-deck-hint" style={{ margin: "0 0 6px" }}>
+                  Bárki megveheti a következő számot 3 🪙-ért, mielőtt elhangozna:
+                </p>
+                <div className="hs-steal-actors">
+                  {players
+                    .filter((p) => p.tokens >= 3 && canActAsMyself(p.id))
+                    .map((p) => (
+                      <button key={p.id} className="hs-ghost-btn" onClick={() => onBeginRedeem(p.id)}>
+                        {p.name} beváltja (🪙 {p.tokens})
+                      </button>
+                    ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {phase === "placing" && current && useTokens && canActAsMyself(current.id) && (
+          <div className="hs-form-actions">
+            <button className="hs-ghost-btn" disabled={current.tokens < 1} onClick={onPass}>
+              Passz (−1 🪙, új kártya)
+            </button>
+          </div>
+        )}
+        {phase === "placing" && current && !canActAsMyself(current.id) && (
+          <p className="hs-deck-hint">Most {current.name} helyezi el a tippjét — te csak nézed.</p>
+        )}
+
+        {phase === "steal_window" && current && (
+          <div className="hs-steal-panel">
+            {!stealActorId && (
+              <div className="hs-steal-actors">
+                {players
+                  .filter((p) => p.id !== current.id && canActAsMyself(p.id))
+                  .map((p) => {
+                    const already = stealAttempts.some((a) => a.playerId === p.id);
+                    return (
+                      <button
+                        key={p.id}
+                        className="hs-ghost-btn"
+                        disabled={(useTokens && p.tokens < 1) || already}
+                        onClick={() => onPickStealActor(p.id)}
+                      >
+                        {p.name} {useTokens ? `(🪙 ${p.tokens})` : ""} {already ? "✓" : ""}
+                      </button>
+                    );
+                  })}
+              </div>
+            )}
+
+            {stealAttempts.length > 0 && (
+              <ul className="hs-steal-list">
+                {stealAttempts.map((a) => {
+                  const p = players.find((x) => x.id === a.playerId);
+                  return (
+                    <li key={a.id}>
+                      {p ? p.name : "?"} tippelt{" "}
+                      {canActAsMyself(a.playerId) && (
+                        <button className="hs-cancel-x" onClick={() => onCancelSteal(a.id)}>
+                          visszavonás
+                        </button>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+
+            <button className="hs-primary-btn hs-reveal-btn" onClick={onBeginRevealEntry}>
+              Kártya felfedése
+            </button>
+          </div>
+        )}
+
+        {phase === "reveal_entry" && (
+          <div className="hs-form">
+            {canEditReveal ? (
+              <>
+                <div className="hs-form-row">
+                  <input
+                    className="hs-year-input"
+                    type="number"
+                    placeholder="Év *"
+                    value={revealForm.year}
+                    onChange={(e) => setRevealForm((f) => ({ ...f, year: e.target.value }))}
+                    autoFocus
+                  />
+                  <input
+                    placeholder="Cím (opcionális)"
+                    value={revealForm.title}
+                    onChange={(e) => setRevealForm((f) => ({ ...f, title: e.target.value }))}
+                  />
+                  <input
+                    placeholder="Előadó (opcionális)"
+                    value={revealForm.artist}
+                    onChange={(e) => setRevealForm((f) => ({ ...f, artist: e.target.value }))}
+                  />
+                </div>
+                <div className="hs-form-actions" style={{ marginBottom: 12 }}>
+                  <button
+                    className="hs-ghost-btn"
+                    disabled={!revealForm.title.trim() && !revealForm.artist.trim()}
+                    onClick={() => {
+                      const q = `${revealForm.artist} ${revealForm.title} megjelenési éve`.trim();
+                      window.open(`https://www.google.com/search?q=${encodeURIComponent(q)}`, "_blank", "noopener,noreferrer");
+                    }}
+                  >
+                    🔍 Év keresése Google-ben
+                  </button>
+                </div>
+                {useTokens && pendingAction !== "redeem" && (
+                  <label className="hs-checkbox" style={{ marginBottom: 14 }}>
+                    <input type="checkbox" checked={bonusGuess} onChange={(e) => setBonusGuess(e.target.checked)} />
+                    {current?.name} (a soron lévő) is eltalálta a címet/előadót (+1 🪙 neki, a kártya sorsától
+                    függetlenül)
+                  </label>
+                )}
+                <button
+                  className="hs-primary-btn"
+                  disabled={!revealYearValid}
+                  onClick={() => onConfirmReveal({ year: revealForm.year, title: revealForm.title, artist: revealForm.artist, bonusGuess })}
+                >
+                  Megerősítés
+                </button>
+              </>
+            ) : (
+              <p className="hs-deck-hint">
+                Várakozás, amíg {pendingAction === "redeem" ? buyer?.name : current?.name} megadja a szám adatait…
+              </p>
+            )}
+          </div>
+        )}
+
+        {phase === "revealed" && result && (
+          <button className="hs-primary-btn" onClick={onNext}>
+            Következő kör →
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TimelineRow({ player, index, isCurrent, isMe, isOffline, interactive, ownSlot, stealAttempts, onGapClick, playersAll }) {
+  const c = playerColor(index);
+  const timeline = player.timeline;
+
+  const gapNode = (slotIdx) => {
+    const isOwn = ownSlot === slotIdx;
+    const stealHere = stealAttempts.find((a) => a.slot === slotIdx);
+    const clickable = interactive && !isOwn && !stealHere;
+    return (
+      <button
+        key={`gap-${slotIdx}`}
+        className={`hs-gap ${clickable ? "clickable" : ""} ${isOwn ? "own-mark" : ""} ${stealHere ? "steal-mark" : ""}`}
+        style={clickable ? { "--pc": c.solid } : undefined}
+        disabled={!clickable}
+        onClick={() => onGapClick(slotIdx)}
+        title={clickable ? "Ide helyezem" : undefined}
+      >
+        {isOwn && <span className="hs-gap-tag">?</span>}
+        {stealHere && (
+          <span className="hs-gap-tag steal">{(playersAll.find((p) => p.id === stealHere.playerId) || {}).name?.[0] || "!"}</span>
+        )}
+      </button>
+    );
+  };
+
+  return (
+    <div className={`hs-timeline-row ${isCurrent ? "is-current" : ""} ${isMe ? "is-me" : ""}`} style={{ "--pc": c.solid }}>
+      <div className="hs-timeline-row-label">
+        <span className="hs-swatch" style={{ background: c.solid }} />
+        {player.name}
+        {isMe && <span className="hs-me-badge">TE</span>}
+        {isOffline && <span className="hs-offline-badge">nincs a szobában</span>}
+        <span className="hs-timeline-count">{timeline.length} kártya</span>
+      </div>
+      <div className="hs-timeline-track">
+        {gapNode(0)}
+        {timeline.map((card, i) => (
+          <React.Fragment key={card.id}>
+            <div className="hs-card-chip" style={{ borderTopColor: c.solid }}>
+              <span className="hs-card-year">{card.year}</span>
+              <span className="hs-card-title">{card.title}</span>
+              <span className="hs-card-artist">{card.artist}</span>
+            </div>
+            {gapNode(i + 1)}
+          </React.Fragment>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function WinnerBanner({ winner, onRestart }) {
+  return (
+    <div className="hs-winner">
+      <div className="hs-winner-vinyl" />
+      <h2>
+        🏆 <span style={{ color: "var(--pink)" }}>{winner.name}</span> nyert!
+      </h2>
+      <p>{winner.timeline.length} kártyával elsőként érte el a célt.</p>
+      <button className="hs-primary-btn" onClick={onRestart}>
+        Új játék indítása
+      </button>
+    </div>
+  );
+}
+
+function LogPanel({ log }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className={`hs-log-panel ${open ? "open" : ""}`}>
+      <button className="hs-log-toggle" onClick={() => setOpen((o) => !o)}>
+        Napló {open ? "▾" : "▸"} ({log.length})
+      </button>
+      {open && (
+        <ul className="hs-log-list">
+          {log.map((entry) => (
+            <li key={entry.id}>{entry.text}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function GlobalStyle() {
+  return (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;700&display=swap');
+
+      :root {
+        --bg: #121319;
+        --panel: #1b1d27;
+        --panel2: #22242f;
+        --text: #f3f1ea;
+        --muted: #9195a6;
+        --pink: #ff3e7f;
+        --yellow: #ffc94d;
+        --teal: #2fdbc4;
+        --purple: #8c6fff;
+        --border: #2c2e3c;
+      }
+
+      .hs-root {
+        min-height: 100vh;
+        background: radial-gradient(ellipse at top, #191b25 0%, var(--bg) 55%);
+        color: var(--text);
+        font-family: 'Inter', sans-serif;
+        padding-bottom: 40px;
+      }
+
+      button { font-family: inherit; cursor: pointer; }
+      input { font-family: inherit; }
+
+      /* ---------- SETUP ---------- */
+      .hs-setup-wrap { max-width: 640px; margin: 0 auto; padding: 32px 16px; }
+      .hs-logo { text-align: center; margin-bottom: 24px; position: relative; }
+      .hs-logo h1 {
+        font-family: 'Space Grotesk', sans-serif;
+        font-size: 42px;
+        letter-spacing: 6px;
+        margin: 10px 0 2px;
+        background: linear-gradient(90deg, var(--pink), var(--yellow), var(--teal), var(--purple));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .hs-logo-sub { color: var(--muted); font-size: 14px; letter-spacing: 1px; }
+      .hs-logo-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin: 0 3px; }
+
+      .hs-setup-card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        padding: 24px;
+      }
+      .hs-setup-card h2 { font-family: 'Space Grotesk', sans-serif; font-size: 18px; margin: 0 0 16px; }
+      .hs-setup-players { display: flex; flex-direction: column; gap: 14px; }
+      .hs-setup-player {
+        background: var(--panel2);
+        border: 1px solid;
+        border-left-width: 4px;
+        border-radius: 12px;
+        padding: 12px;
+      }
+      .hs-setup-player-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+      .hs-setup-player-head input {
+        flex: 1;
+        background: transparent;
+        border: none;
+        border-bottom: 1px solid var(--border);
+        color: var(--text);
+        font-size: 15px;
+        font-weight: 600;
+        padding: 4px 2px;
+        outline: none;
+      }
+      .hs-swatch { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; }
+      .hs-mini-label { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+      .hs-setup-row { display: flex; gap: 8px; flex-wrap: wrap; }
+      .hs-setup-row input, .hs-form-row input {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 8px 10px;
+        color: var(--text);
+        font-size: 13px;
+        outline: none;
+      }
+      .hs-setup-row input:focus, .hs-form-row input:focus { border-color: var(--pink); }
+      .hs-year-input { width: 84px; font-family: 'JetBrains Mono', monospace; }
+      .hs-setup-row input:not(.hs-year-input), .hs-form-row input:not(.hs-year-input) { flex: 1; min-width: 100px; }
+
+      .hs-icon-btn {
+        background: transparent; border: none; color: var(--muted);
+        font-size: 20px; line-height: 1; padding: 2px 6px;
+      }
+      .hs-icon-btn:hover { color: var(--pink); }
+
+      .hs-add-player {
+        margin-top: 12px; width: 100%;
+        background: transparent; border: 1px dashed var(--border);
+        border-radius: 10px; color: var(--muted); padding: 10px;
+        font-size: 13px;
+      }
+      .hs-add-player:hover { border-color: var(--teal); color: var(--teal); }
+
+      .hs-setup-options { display: flex; flex-wrap: wrap; gap: 18px; margin: 20px 0; align-items: center; }
+      .hs-checkbox { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+      .hs-number-field { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+      .hs-number-field input {
+        width: 56px; background: var(--panel2); border: 1px solid var(--border);
+        border-radius: 6px; color: var(--text); padding: 4px 6px; text-align: center;
+      }
+
+      .hs-start-btn {
+        width: 100%; padding: 14px; border: none; border-radius: 12px;
+        background: linear-gradient(90deg, var(--pink), var(--purple));
+        color: white; font-weight: 700; font-size: 16px; letter-spacing: 0.5px;
+      }
+      .hs-start-btn:hover { filter: brightness(1.1); }
+      .hs-continue-card { border-color: var(--teal); }
+
+      /* ---------- HEADER ---------- */
+      .hs-header {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 14px 20px; border-bottom: 1px solid var(--border);
+        position: sticky; top: 0; background: rgba(18,19,25,0.9); backdrop-filter: blur(6px); z-index: 10;
+        flex-wrap: wrap; gap: 8px;
+      }
+      .hs-header-logo { display: flex; align-items: center; gap: 5px; font-family: 'Space Grotesk', sans-serif; letter-spacing: 2px; }
+      .hs-logo-dot.small { width: 7px; height: 7px; }
+      .hs-header-meta { color: var(--muted); font-size: 13px; }
+      .hs-reset-btn {
+        background: transparent; border: 1px solid var(--border); color: var(--muted);
+        padding: 6px 12px; border-radius: 8px; font-size: 12px;
+      }
+      .hs-reset-btn:hover { border-color: var(--pink); color: var(--pink); }
+
+      /* ---------- MULTIPLAYER / MODE SELECTOR ---------- */
+      .hs-mode-tabs {
+        display: flex; gap: 4px; background: var(--bg); border: 1px solid var(--border);
+        padding: 4px; border-radius: 12px;
+      }
+      .hs-mode-tab {
+        flex: 1; background: transparent; border: none; color: var(--muted);
+        padding: 11px 6px; border-radius: 9px; font-size: 13px; font-weight: 600;
+        text-align: center; white-space: nowrap;
+      }
+      .hs-mode-tab.active {
+        background: linear-gradient(90deg, var(--pink), var(--purple));
+        color: white; box-shadow: 0 4px 14px rgba(255, 62, 127, 0.25);
+      }
+      .hs-mp-error { color: var(--pink); font-size: 13px; margin-top: 8px; }
+      .hs-mp-badge {
+        color: var(--teal); font-size: 12px; border: 1px solid var(--teal); border-radius: 999px;
+        padding: 4px 10px; white-space: nowrap;
+      }
+      .hs-room-code-card { text-align: center; }
+      .hs-room-code-big {
+        font-family: 'JetBrains Mono', monospace; font-weight: 700;
+        font-size: 56px; letter-spacing: 14px;
+        background: linear-gradient(90deg, var(--pink), var(--yellow), var(--teal), var(--purple));
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+        margin: 6px 0; line-height: 1.1;
+      }
+      .hs-mp-identity {
+        background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+        border-radius: 8px; padding: 5px 8px; font-size: 12px;
+      }
+      .hs-jump-btn {
+        background: transparent; border: 1px solid var(--pink); color: var(--pink);
+        border-radius: 999px; padding: 5px 10px; font-size: 12px; font-weight: 600;
+      }
+      .hs-jump-btn:hover { background: var(--pink); color: white; }
+      .hs-me-badge {
+        background: var(--pink); color: white; font-size: 9px; font-weight: 700;
+        padding: 2px 6px; border-radius: 999px; letter-spacing: 0.5px;
+      }
+      .hs-timeline-row.is-me { box-shadow: 0 0 0 2px var(--pink) inset; }
+      .hs-ready-badge {
+        background: var(--teal); color: #12131a; font-size: 9px; font-weight: 700;
+        padding: 2px 6px; border-radius: 999px; letter-spacing: 0.3px;
+      }
+      .hs-start-btn.hs-ready-active { background: linear-gradient(90deg, var(--teal), var(--purple)); }
+      .hs-offline-badge {
+        background: transparent; color: var(--muted); font-size: 10px; font-weight: 600;
+        border: 1px solid var(--border); padding: 1px 6px; border-radius: 999px; margin-left: 6px;
+      }
+
+      /* ---------- LOBBY ---------- */
+      .hs-lobby-players { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+      .hs-lobby-chip {
+        display: flex; align-items: center; gap: 6px;
+        background: var(--panel2); border: 1px solid; border-radius: 999px;
+        padding: 8px 12px; font-size: 14px; font-weight: 600;
+      }
+      .hs-saved-names { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+      .hs-name-chip {
+        background: var(--panel2); border: 1px dashed var(--border); color: var(--muted);
+        border-radius: 999px; padding: 6px 12px; font-size: 12px;
+      }
+      .hs-name-chip:hover { border-color: var(--teal); color: var(--teal); }
+      .hs-name-chip.selected {
+        background: var(--teal); border-style: solid; border-color: var(--teal); color: #12131a; font-weight: 700;
+      }
+
+      .hs-back-btn {
+        background: transparent; border: none; color: var(--muted); font-size: 13px;
+        padding: 4px 0; font-weight: 600;
+      }
+      .hs-back-btn:hover { color: var(--pink); }
+      .hs-lobby-top-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+      .hs-manage-link {
+        display: block; width: 100%; text-align: center; margin-top: 4px;
+        background: transparent; border: none; color: var(--muted); font-size: 13px; padding: 10px;
+      }
+      .hs-manage-link:hover { color: var(--teal); }
+
+      .hs-order-list { display: flex; flex-direction: column; gap: 8px; }
+      .hs-order-row {
+        display: flex; align-items: center; gap: 8px;
+        background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px;
+      }
+      .hs-order-num { font-family: 'JetBrains Mono', monospace; color: var(--muted); font-size: 12px; width: 16px; }
+      .hs-order-name { flex: 1; font-size: 14px; font-weight: 600; display: flex; align-items: center; }
+      .hs-order-arrows { display: flex; gap: 4px; }
+      .hs-order-arrows .hs-icon-btn { font-size: 14px; }
+
+      /* ---------- PLAYER STRIP ---------- */
+      .hs-player-strip { display: flex; gap: 10px; padding: 16px 20px; overflow-x: auto; }
+      .hs-player-chip {
+        display: flex; align-items: center; gap: 6px;
+        background: var(--panel); border: 1px solid var(--border);
+        border-radius: 999px; padding: 8px 14px; font-size: 13px; white-space: nowrap;
+        flex-shrink: 0;
+      }
+      .hs-player-chip.is-current { border-color: var(--pc); box-shadow: 0 0 0 1px var(--pc); }
+      .hs-player-name { font-weight: 600; }
+      .hs-player-count, .hs-token-count { color: var(--muted); font-size: 12px; }
+      .hs-turn-badge {
+        background: var(--pc); color: #12131a; font-weight: 700; font-size: 10px;
+        padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.5px;
+      }
+      .hs-kezd-badge {
+        background: var(--teal); color: #12131a; font-weight: 700; font-size: 10px;
+        padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.5px;
+      }
+
+      /* ---------- MAIN LAYOUT ---------- */
+      .hs-main { display: flex; flex-direction: column; gap: 16px; padding: 0 20px; max-width: 900px; margin: 0 auto; }
+
+      /* ---------- TURNTABLE ---------- */
+      .hs-deck {
+        background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+        padding: 12px 16px; display: flex; flex-direction: column; gap: 10px;
+      }
+      .hs-deck-top { display: flex; align-items: center; gap: 12px; }
+      .hs-vinyl {
+        width: 44px; height: 44px; border-radius: 50%; flex-shrink: 0;
+        background:
+          repeating-radial-gradient(circle, #0c0d12 0px, #0c0d12 2px, #17181f 3px, #17181f 4px),
+          conic-gradient(var(--pink), var(--yellow), var(--teal), var(--purple), var(--pink));
+        display: flex; align-items: center; justify-content: center;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      }
+      .hs-vinyl.spin { animation: hs-spin 3.2s linear infinite; }
+      .hs-vinyl.flip { animation: hs-pop 0.4s ease; }
+      @keyframes hs-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+      @keyframes hs-pop { 0% { transform: scale(0.85); } 60% { transform: scale(1.06); } 100% { transform: scale(1); } }
+      .hs-vinyl-label {
+        width: 20px; height: 20px; border-radius: 50%; background: var(--bg);
+        display: flex; align-items: center; justify-content: center;
+        font-family: 'JetBrains Mono', monospace; color: var(--text); font-size: 9px; font-weight: 700;
+      }
+      .hs-vinyl-idle { font-size: 11px; color: var(--muted); }
+      .hs-vinyl-year { font-size: 9px; }
+
+      .hs-deck-turn { margin: 0; font-size: 14px; line-height: 1.35; flex: 1; }
+      .hs-deck-turn.hs-result-correct { color: var(--teal); }
+      .hs-deck-turn.hs-result-stolen { color: var(--yellow); }
+      .hs-deck-turn.hs-result-discard { color: var(--muted); }
+      .hs-deck-panel {}
+      .hs-deck-hint { color: var(--muted); font-size: 12px; }
+
+      .hs-form-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+      .hs-form-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+
+      .hs-primary-btn {
+        background: linear-gradient(90deg, var(--pink), var(--purple));
+        border: none; color: white; font-weight: 700; font-size: 14px;
+        padding: 10px 18px; border-radius: 10px;
+      }
+      .hs-primary-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+      .hs-primary-btn:not(:disabled):hover { filter: brightness(1.1); }
+
+      .hs-ghost-btn {
+        background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+        font-size: 13px; padding: 9px 14px; border-radius: 10px;
+      }
+      .hs-ghost-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+      .hs-ghost-btn:not(:disabled):hover { border-color: var(--teal); }
+
+      .hs-steal-panel { display: flex; flex-direction: column; gap: 10px; }
+      .hs-steal-actors { display: flex; gap: 8px; flex-wrap: wrap; }
+      .hs-steal-list { list-style: none; margin: 0; padding: 0; font-size: 13px; color: var(--muted); }
+      .hs-steal-list li { margin-bottom: 4px; }
+      .hs-cancel-x { background: none; border: none; color: var(--pink); font-size: 12px; text-decoration: underline; padding: 0; }
+      .hs-reveal-btn { align-self: flex-start; margin-top: 6px; }
+
+      /* ---------- TIMELINES ---------- */
+      .hs-timelines { display: flex; flex-direction: column; gap: 14px; margin-bottom: 20px; }
+      .hs-timeline-row {
+        background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+        padding: 12px 14px;
+      }
+      .hs-timeline-row.is-current { border-color: var(--pc); box-shadow: 0 0 0 1px var(--pc) inset; }
+      .hs-timeline-row-label { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; margin-bottom: 10px; }
+      .hs-timeline-count { margin-left: auto; font-weight: 400; color: var(--muted); font-size: 12px; }
+      .hs-timeline-track { display: flex; align-items: center; overflow-x: auto; padding-bottom: 4px; }
+      .hs-card-chip {
+        background: var(--panel2); border-top: 3px solid; border-radius: 8px;
+        padding: 8px 10px; min-width: 96px; flex-shrink: 0;
+        display: flex; flex-direction: column; gap: 2px;
+      }
+      .hs-card-year { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 15px; }
+      .hs-card-title { font-size: 11px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px; }
+      .hs-card-artist { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px; }
+
+      .hs-gap {
+        width: 14px; min-width: 14px; height: 40px; border: none; background: transparent;
+        position: relative; flex-shrink: 0;
+      }
+      .hs-gap.clickable { background: var(--border); border-radius: 3px; }
+      .hs-gap.clickable:hover { background: var(--pc); }
+      .hs-gap-tag {
+        position: absolute; top: -6px; left: 50%; transform: translateX(-50%);
+        background: var(--yellow); color: #12131a; font-size: 10px; font-weight: 700;
+        border-radius: 50%; width: 16px; height: 16px; display: flex; align-items: center; justify-content: center;
+      }
+      .hs-gap-tag.steal { background: var(--purple); color: white; }
+
+      /* ---------- WINNER ---------- */
+      .hs-winner { max-width: 480px; margin: 60px auto; text-align: center; }
+      .hs-winner-vinyl {
+        width: 140px; height: 140px; border-radius: 50%; margin: 0 auto 20px;
+        background: conic-gradient(var(--pink), var(--yellow), var(--teal), var(--purple), var(--pink));
+        animation: hs-spin 6s linear infinite;
+      }
+      .hs-winner h2 { font-family: 'Space Grotesk', sans-serif; font-size: 26px; }
+
+      /* ---------- LOG ---------- */
+      .hs-log-panel { max-width: 900px; margin: 0 auto; padding: 0 20px 20px; }
+      .hs-log-toggle {
+        background: transparent; border: none; color: var(--muted); font-size: 13px; padding: 6px 0;
+      }
+      .hs-log-list {
+        list-style: none; margin: 8px 0 0; padding: 0; max-height: 220px; overflow-y: auto;
+        display: flex; flex-direction: column-reverse; gap: 6px;
+      }
+      .hs-log-list li { font-size: 12px; color: var(--muted); border-left: 2px solid var(--border); padding-left: 8px; }
+
+      @media (max-width: 600px) {
+        .hs-card-title, .hs-card-artist { max-width: 90px; }
+      }
+
+      /* Landscape phones: shorter viewport height, more width - keep chrome compact so the
+         timelines (the whole point of rotating the phone) get maximum vertical room. */
+      @media (orientation: landscape) and (max-height: 500px) {
+        .hs-header { padding: 8px 16px; }
+        .hs-player-strip { padding: 8px 16px; }
+        .hs-deck { padding: 10px 14px; }
+        .hs-vinyl { width: 36px; height: 36px; }
+        .hs-setup-wrap { padding: 16px; }
+      }
+    `}</style>
+  );
+}
+
+</script>
+
+<script>
+  window.addEventListener("DOMContentLoaded", function () {
+    // Give slow connections a brief grace period, then check what actually loaded.
+    setTimeout(function () {
+      if (!window.__loaded.react || !window.__loaded.reactDom || !window.__loaded.babel) {
+        var missing = [];
+        if (!window.__loaded.react) missing.push("React");
+        if (!window.__loaded.reactDom) missing.push("ReactDOM");
+        if (!window.__loaded.babel) missing.push("Babel");
+        if (missing.length) {
+          showBootError(
+            "Nem sikerult betolteni: " + missing.join(", ") +
+            ". Ez altalaban azt jelenti, hogy a halozat/bongeszo blokkolja a cdnjs.cloudflare.com eleresett. " +
+            "Probald masik Wi-Fi/mobilnet halozaton, vagy kapcsold ki az esetleges hirdetesblokkolot/VPN-t erre az oldalra."
+          );
+          return;
+        }
+      }
+      try {
+        var src = document.getElementById("hitster-source").textContent;
+        var compiled = Babel.transform(src, {
+          presets: [["react", { runtime: "classic" }]]
+        }).code;
+
+        var runComponent = new Function(
+          "React", "ReactDOM", "useState", "useEffect", "useRef", "Fragment",
+          compiled + "\nreturn HitsterTracker;"
+        );
+        var HitsterTracker = runComponent(
+          React, ReactDOM, React.useState, React.useEffect, React.useRef, React.Fragment
+        );
+
+        var root = ReactDOM.createRoot(document.getElementById("root"));
+        root.render(React.createElement(HitsterTracker));
+      } catch (err) {
+        showBootError("Hiba a betoltes soran:\n" + (err && err.message ? err.message : err));
+        console.error(err);
+      }
+    }, 300);
+  });
+</script>
+</body>
+</html>
