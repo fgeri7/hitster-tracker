@@ -1,0 +1,19 @@
+{
+  "id": "/",
+  "name": "Hitster Tracker",
+  "short_name": "Hitster Tracker",
+  "description": "Hitster játékmenet-vezető - idővonal, zsetonok és többjátékos mód.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#121319",
+  "theme_color": "#121319",
+  "lang": "hu",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
